@@ -1,0 +1,952 @@
+// var i = json.read('text.json')
+
+
+
+
+
+/////////////////////////////////////
+// SS WORLD
+/////////////////////////////////////
+//
+// (TODO: make this a package!)
+//
+// World is 100-by-100 units large. Ball always moves at fixed speed
+//
+// Plan to generate worlds:
+//
+// 1) Generate world geometry, including Red and Green blocks
+// 2) Draw parameters:
+//     ~ target = flip(P_gr) to choose green/red start.
+// 3) Spawn a ball from the chosen final collision box, with a velocity moving away from the spawn face (diagonally)
+// 4) Simulate this ball forward from that point, out until it hits one of R/G again.
+// 5) Sim starts from halfway through this collision-to-collision traj
+// 
+var world_wide = 100; // units
+var world_high = 100; // units
+var expected_num_blocks = 15;
+var world_ball_speed = 40; // units/s
+var world_ball_radius = 2; // units/s
+var world_timestep = 0.03;
+
+/*
+ * make a random block
+ *
+ * blocks are stored as lists [x1,y1,x2,y2]
+ */
+var makeGeom = function(xmin,ymin,xmax,ymax,wmin,hmin,wmax,hmax) {
+  var xmid = uniform(xmin,xmax); //uniform(0,world_wide);
+  var ymid = uniform(ymin,ymax); //uniform(0,world_high);
+  var halfwidth = uniform(wmin,wmax);
+  var halfheight = uniform(hmin,hmax);
+  
+  return [xmid-halfwidth, ymid-halfheight, xmid+halfwidth, ymid+halfheight]
+}
+
+/*
+ * make 4 blocks to make a container defined by its interior and
+ * with a given thickness
+ *
+ * inner_dims should be the "negative" interior block
+ * thickness should be a number, in world coordinate units
+ *
+ * blocks are stored as lists [x1,y1,x2,y2]
+ */
+var makeBlockContainer = function(inner_dims,thickness) {
+  var x0 = inner_dims[0];
+  var y0 = inner_dims[1];
+  var x1 = inner_dims[2];
+  var y1 = inner_dims[3];
+
+  var leftBlock  = [x0-thickness, y0-thickness, x0, y1+thickness];
+  var lowerBlock = [x0, y0-thickness, x1, y0];
+  var rightBlock = [x1, y0-thickness, x1+thickness, y1+thickness];
+  var upperBlock = [x0, y1, x1, y1+thickness];
+  
+  return [leftBlock,lowerBlock,rightBlock,upperBlock]
+}
+
+
+/*
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * geom is a list of blocks [[x1_1,y1_1,x2_1,y2_1], [x1_2,y1_2,x2_2,y2_2], [x1_3,y1_3,x2_3,y2_3], ...]
+ * timestep is a number in seconds.
+ */
+var advanceBallOneTimestep = function(ball, geom_list, ball_radius, timestep_size) {
+  var ballxnew = ball[0] + timestep_size*ball[2];
+  var ballynew = ball[1] + timestep_size*ball[3];
+  return [ballxnew, ballynew, ball[2], ball[3]];
+}
+
+/*
+ * Step the ball through n timesteps (without collisions)
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * geom is a list of blocks [[x1_1,y1_1,x2_1,y2_1], [x1_2,y1_2,x2_2,y2_2], [x1_3,y1_3,x2_3,y2_3], ...]
+ * timestep is a number in seconds.
+ */
+var advanceBallNTimesteps = function(ball, geom_list, ball_radius, timestep_size, n) {
+  return n < 1 ? [ball] : [ball].concat(advanceBallNTimesteps(
+                                            advanceBallOneTimestep(ball,geom_list,ball_radius,timestep_size),
+                                            geom_list,
+                                            ball_radius,
+                                            timestep_size,
+                                            n-1));
+}
+
+
+/*
+ * Steps the ball up to its next collision. Returns the new ball, the time the collision took, and the id of the hit wall.
+ * (Returns old ball and -1 if no collision) [ball, time, id]
+ *
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * geom is a list of blocks [[x1_1,y1_1,x2_1,y2_1], [x1_2,y1_2,x2_2,y2_2], [x1_3,y1_3,x2_3,y2_3], ...]
+ * timestep is a number in seconds.
+ */
+var advanceBallOneTimeCollision = function(ball, geom_list, ball_radius, time_to_advance) {
+  var geomCollisions = mapIndexed(function(index,block) { return [index,nextCollision(ball, block, ball_radius)] }, geom_list);
+  var imminentCollision = reduce( function(x, acc) { return acc[2] < x[1][1] ? acc : [x[0],x[1][0],x[1][1]] },
+                                  [-1,-1,time_to_advance],
+                                  geomCollisions );
+  var collId = imminentCollision[0];
+  var collFace = imminentCollision[1];
+  var collTime = imminentCollision[2];
+
+  var vTransforms = [[-1,1],[1,-1],[-1,1],[1,-1]];
+  var vTransform = collFace >= 0 ? vTransforms[collFace] : [1,1];
+  var ballNew = [ball[0]+collTime*ball[2],
+                 ball[1]+collTime*ball[3],
+                 ball[2]*vTransform[0],
+                 ball[3]*vTransform[1]];
+
+  return [ballNew, collTime, collId];
+}
+
+
+/*
+ * Steps the ball through the next time_to_advance's worth of collisions.
+ * If a collision won't be encountered within time_to_advance seconds, stops short.
+ *
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * geom is a list of blocks [[x1_1,y1_1,x2_1,y2_1], [x1_2,y1_2,x2_2,y2_2], [x1_3,y1_3,x2_3,y2_3], ...]
+ * ball_radius is a radius
+ * coll_set is the set of block indices the block's striking of which would trigger an end to the traj.
+ * maxTime is the max length of time to consider
+ * maxN is the max number of collisions to collision
+ */
+var advanceBallUntilCollisions = function(ball, geom_list, ball_radius, coll_set, maxTime, maxN) {
+  var nextCollision = advanceBallOneTimeCollision(ball,geom_list,ball_radius,maxTime);
+  
+  var ballNew = nextCollision[0];
+  var timeToCollide = nextCollision[1];
+  var collidedBlockId = nextCollision[2];
+  
+  var timeRemaining = maxTime - timeToCollide;
+  
+  var getNextResults = function() {
+    var results = advanceBallUntilCollisions(ballNew,
+                                              geom_list,
+                                              ball_radius,
+                                              coll_set,
+                                              timeRemaining,
+                                              maxN - 1);
+    var ballTraj = [ball].concat(results[0]);
+    var tColl = timeToCollide + results[1];
+    var collidedId = results[2];
+    
+    return [ballTraj, tColl, collidedId];
+  }
+  
+  var timeIsRemaining = timeRemaining >= .001;
+  var collisionsAreRemaining = maxN >= 1;
+  var haventHitTargets = !any(function(x) { return x == collidedBlockId }, coll_set);
+  
+  return  !(timeIsRemaining && collisionsAreRemaining && haventHitTargets) ?
+            [[ball,ballNew], timeToCollide, haventHitTargets ? -1 : collidedBlockId] : getNextResults();
+}
+
+/*
+ * Steps the ball through the next time_to_advance's worth of collisions.
+ * If a collision won't be encountered within time_to_advance seconds, stops short.
+ *
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * geom is a list of blocks [[x1_1,y1_1,x2_1,y2_1], [x1_2,y1_2,x2_2,y2_2], [x1_3,y1_3,x2_3,y2_3], ...]
+ * timestep is a number in seconds.
+ */
+var advanceBallTimeCollisions = function(ball, geom_list, ball_radius, time_to_advance, maxN) {
+  var nextCollision = advanceBallOneTimeCollision(ball,geom_list,ball_radius,time_to_advance);
+  
+  var ballNew = nextCollision[0];
+  var timeToCollide = nextCollision[1];
+  var collidedBlockId = nextCollision[2];
+  
+  var timeRemaining = time_to_advance - timeToCollide;
+  
+  return timeRemaining < .001 || maxN < 1 ? [ball,ballNew] : [ball].concat(advanceBallTimeCollisions(
+                                            ballNew,
+                                            geom_list,
+                                            ball_radius,
+                                            timeRemaining,
+                                            maxN - 1));
+}
+
+/*
+ * Steps the ball up to its next collision. Returns the new ball, the time the collision took, and the id of the hit wall.
+ * (Returns old ball and -1 if no collision) [ball, time, id]
+ *
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * geom is a list of blocks [[x1_1,y1_1,x2_1,y2_1], [x1_2,y1_2,x2_2,y2_2], [x1_3,y1_3,x2_3,y2_3], ...]
+ * timestep is a number in seconds.
+ */
+var advanceBallOneCollision = function(ball, geom_list, ball_radius) {
+  var geomCollisions = mapIndexed(function(index,block) { return [index,nextCollision(ball, block, ball_radius)] }, geom_list);
+  var imminentCollision = reduce( function(x, acc) { return acc[2] < x[1][1] ? acc : [x[0],x[1][0],x[1][1]] },
+                                  [-1,-1,Infinity],
+                                  geomCollisions );
+  var collId = imminentCollision[0];
+  var collFace = imminentCollision[1];
+  var collTime = imminentCollision[2];
+
+  var vTransforms = [[-1,1],[1,-1],[-1,1],[1,-1]];
+//  var vTransform = vTransforms[collFace];
+  var ballNew = collTime == Infinity ? [3.14,3.14,3.14,3.14] :
+                [ball[0]+collTime*ball[2],
+                 ball[1]+collTime*ball[3],
+                 ball[2]*vTransforms[collFace][0],
+                 ball[3]*vTransforms[collFace][1]];
+
+  return [ballNew, collTime, collId];
+}
+
+/*
+ * ball is a list: [ball_x, ball_y, ball_xv, ball_yv]
+ * block is a list: [x0,y0,x1,y1]
+ *
+ * returns [face, timeToCollide] -- face = -1 if no collision, otherwise: [left,lower,right,upper]
+ */
+var nextCollision = function(ball, block, ball_radius) {
+  var ballx = ball[0];
+  var bally = ball[1];
+  var ballxv = ball[2];
+  var ballyv = ball[3];
+  
+  var x0 = block[0]-ball_radius;
+  var y0 = block[1]-ball_radius;
+  var x1 = block[2]+ball_radius;
+  var y1 = block[3]+ball_radius;
+  
+  var collTimeLeftPlane = (ballx - x0) * ballxv < -0.000001 ? (x0 - ballx)/ballxv : Infinity;
+  var collTimeLowerPlane = (bally - y0) * ballyv < -0.000001 ? (y0 - bally)/ballyv : Infinity;
+  var collTimeRightPlane = (ballx - x1) * ballxv < -0.000001 ? (x1 - ballx)/ballxv : Infinity;
+  var collTimeUpperPlane = (bally - y1) * ballyv < -0.000001 ? (y1 - bally)/ballyv : Infinity;
+
+  var collTimeLeftFace = (bally + ballyv * collTimeLeftPlane) >= y0 &&
+                              (bally + ballyv * collTimeLeftPlane) <= y1 ?
+                                   collTimeLeftPlane : Infinity;
+  var collTimeLowerFace = (ballx + ballxv * collTimeLowerPlane) >= x0 &&
+                              (ballx + ballxv * collTimeLowerPlane) <= x1 ?
+                                   collTimeLowerPlane : Infinity;
+  var collTimeRightFace = (bally + ballyv * collTimeRightPlane) >= y0 &&
+                              (bally + ballyv * collTimeRightPlane) <= y1 ?
+                                   collTimeRightPlane : Infinity; 
+  var collTimeUpperFace = (ballx + ballxv * collTimeUpperPlane) >= x0 &&
+                              (ballx + ballxv * collTimeUpperPlane) <= x1 ?
+                                   collTimeUpperPlane : Infinity; 
+
+  return reduce(function(x, acc) { return (x[1] < acc[1]) ? x : acc },
+                [-1,Infinity],
+                [[0,collTimeLeftFace],
+                 [1,collTimeLowerFace],
+                 [2,collTimeRightFace],
+                 [3,collTimeUpperFace]] );
+}
+
+/*
+ * Spawns a ball on this block, loosely trying to ensure that
+ * the ball does something nontrivial
+ *
+ * block is [x0,y0,x1,y1]
+ *
+ * returns ball as [x,y,xv,yv]
+ */
+var spawnBallOnBlock = function(block, ball_radius) {
+  var x0 = block[0]-ball_radius;
+  var y0 = block[1]-ball_radius;
+  var x1 = block[2]+ball_radius;
+  var y1 = block[3]+ball_radius;
+  
+  // Choose face
+  var faceHorizontal = 0 + flip(0.5);
+  var faceHigh = 0 + flip(0.5);
+  
+  // Choose point on face
+  var faceLengths = [y1-y0,x1-x0] // function of whether vertical/horizontal
+  var length = uniform(0,faceLengths[faceHorizontal]);
+  var ballx = faceHorizontal ?
+                (x0 + length) :
+                (faceHigh ? x1 : x0);
+  var bally = faceHorizontal ?
+                (faceHigh ? y1 : y0) :
+                (y0 + length);
+  
+  // Choose velocity. Try not to make it too horizontal/vertical
+  var faceNormals = [[[-1,0],[1,0]],[[0,-1],[0,1]]];
+  var faceNormal = faceNormals[faceHorizontal][faceHigh];
+  var faceFlips = [[[-1,1],[-1,1]],[[1,-1],[1,-1]]];
+  var faceFlip = faceFlips[faceHorizontal][faceHigh];
+  
+  var dir = flip(0.5) ? 1 : -1;
+  var ballvPred = [dir * gaussian(10.0,1.0),dir * gaussian(10.0,1.0)];
+  var ballv = (ballvPred[0]*faceNormal[0] + ballvPred[1]*faceNormal[1]) > 0 ?
+                ballvPred : [ballvPred[0]*faceFlip[0],ballvPred[1]*faceFlip[1]];
+  return [ballx, bally, ballv[0], ballv[1]];
+}
+
+/*
+ * true if ball overlaps block, false otherwise (eg. if just touching)
+ *
+ * can input a negative ball_radius, will constrict boundary instead of padding it
+ */
+var ballOverlapsGeom = function(ball, block, ball_radius) {
+  var x0 = block[0]-ball_radius;
+  var y0 = block[1]-ball_radius;
+  var x1 = block[2]+ball_radius;
+  var y1 = block[3]+ball_radius;
+  
+  var ballx = ball[0];
+  var bally = ball[1];
+  
+  return (x0 < ballx) && (ballx < x1) && (y0 < bally) && (bally < y1);
+}
+
+/*
+ * true if block overlaps block, false otherwise (eg. if just touching)
+ */
+var geomOverlapsGeom = function(block1, block2) {
+  var x0 = block1[0];
+  var y0 = block1[1];
+  var x1 = block1[2];
+  var y1 = block1[3];
+  
+  var x02 = block2[0];
+  var y02 = block2[1];
+  var x12 = block2[2];
+  var y12 = block2[3];
+  
+  return (x0 < x12) && (x1 > x02) && (y0 < y12) && (y1 > y02);
+}
+
+/*
+ * true if block1 completely covers block2, false otherwise (eg. if just touching)
+ */
+var geomCoversGeom = function(block1, block2) {
+  var x0 = block1[0];
+  var y0 = block1[1];
+  var x1 = block1[2];
+  var y1 = block1[3];
+  
+  var x02 = block2[0];
+  var y02 = block2[1];
+  var x12 = block2[2];
+  var y12 = block2[3];
+  
+  return (x0 < x02) && (x1 > x12) && (y0 < y02) && (y1 > y12);
+}
+
+/*
+ * make a random block so as not to have it overlapping the world geometry.
+ *
+ * blocks are stored as lists [x1,y1,x2,y2]
+ */
+var makeGeomNonOverlapping = function(geom_list,xmin,ymin,xmax,ymax,wmin,hmin,wmax,hmax) {
+  var attempt = makeGeom(xmin,ymin,xmax,ymax,wmin,hmin,wmax,hmax);
+  return all(function(block){return !geomOverlapsGeom(attempt,block)}, geom_list)
+          ? attempt : makeGeomNonOverlapping(geom_list,xmin,ymin,xmax,ymax,wmin,hmin,wmax,hmax)
+}
+
+/**
+ * takes a list of geometry and makes an occupancy grid out of them.
+ *
+ * takes in specs of grid
+ * cell size is the length in world coords of one edge of a block
+ * returns occupancy grid; undefined where freespace, otherwise it's the id of the
+ * block occupying that cell (lower-id blocks take priority over higher-id)
+ */
+var makeGeomGrid = function(geom_list, buffer_dir_list, world_wide, world_high, cell_size) {
+  var num_rows = Math.ceil(world_high / cell_size);
+  var num_cols = Math.ceil(world_wide / cell_size);
+
+  // for each cell in grid, check geom_list for any cell that overlaps it
+  var initGrid = mapN(
+        function(row) {
+          return mapN(
+                function(col) {
+                  var result = find(
+                          function(i) {
+                            return ballOverlapsGeom([(col+0.5)*cell_size, (row+0.5)*cell_size,0,0], geom_list[i], buffer_dir_list[i]*cell_size);
+                          },
+                          mapN(function(i) { return i }, geom_list.length));
+                  return result==undefined ? -1 : result
+                },
+                num_cols)
+        },
+        num_rows);
+  
+  return initGrid;
+}
+
+var makeWorldGrid = function(world) {
+  var bufferDirList = mapIndexed(function(i,block) { return i < 2 ? 1 : 0.5 }, world.geom_list);
+
+  return {world_grid:makeGeomGrid(world.geom_list, bufferDirList, world.world_dims[0], world.world_dims[1], world.ball_radius), cell_size:world.ball_radius};
+}
+
+var makeWorld = function(pgr, pconn, tmax, tgamma) {
+  var num_blocks = binomial(0.7,expected_num_blocks/0.7);
+  // var t_coll = tmin + exponential(tgamma);
+  var hit_block = 0 + flip(pgr);
+  
+  var collision_blocks = repeat(num_blocks, function() { return makeGeom(0,0,world_wide,world_high,world_wide/20,world_high/20, world_wide/6,world_high/6) });
+  var red_block = makeGeomNonOverlapping(collision_blocks,10,10,world_wide-10,world_high-10,2.5,2.5,5,5);
+  var green_block = makeGeomNonOverlapping(collision_blocks,10,10,world_wide-10,world_high-10,2.5,2.5,5,5);
+  var boundary_blocks = makeBlockContainer([-0.1,-0.1,world_wide+0.1,world_high+0.1],10)
+
+  var geom_list = reduce(function(x, acc) { return x.concat(acc) },
+                         [], [[red_block],[green_block],collision_blocks,boundary_blocks])
+
+  // RED block is the first item in geom_list
+  // GREEN block is the second item in geom_list
+  
+  // Simulate the ball flying from hit_block out t_coll seconds, but reverse them.
+  var ball_init_dir = spawnBallOnBlock(geom_list[hit_block], world_ball_radius); //[10,10,10,10] 
+  var ball_init_dir_speed = Math.hypot(ball_init_dir[2], ball_init_dir[3]);
+  var ball_init = [ball_init_dir[0], ball_init_dir[1],
+                      world_ball_speed * ball_init_dir[2]/ball_init_dir_speed,
+                      world_ball_speed * ball_init_dir[3]/ball_init_dir_speed];
+//  var ball_traj = advanceBallNTimesteps(ball_init, geom_list, world_ball_radius, world_timestep, t_coll / world_timestep);
+//  var ball_traj = advanceBallTimeCollisions(ball_init, geom_list, world_ball_radius, t_coll, 50);
+
+  var collisionResultsFirst = advanceBallUntilCollisions(ball_init, geom_list, world_ball_radius, [0,1], tmax, 5000);
+  var tCollFirst = collisionResultsFirst[1];
+
+  var collisionResults = advanceBallUntilCollisions(ball_init, geom_list, world_ball_radius, [0,1], tCollFirst/2 + .01, 5000);
+  
+  var t_coll = collisionResults[1];
+  
+  var ballTrajReversed = collisionResults[0];
+  var ball_traj = mapN(
+                  function(i){
+                    return [ballTrajReversed[ballTrajReversed.length-i-1][0],
+                            ballTrajReversed[ballTrajReversed.length-i-1][1],
+                            -ballTrajReversed[(2*ballTrajReversed.length-i-2) % ballTrajReversed.length][2],
+                            -ballTrajReversed[(2*ballTrajReversed.length-i-2) % ballTrajReversed.length][3]];
+                    }, ballTrajReversed.length);
+  
+  return { "geom_list":geom_list,
+           "t_coll":t_coll,
+           "ball_radius":world_ball_radius,
+           "world_dims":[100, 100],
+           "timestep_size":world_timestep,
+           "ball_traj":ball_traj,
+           "hit_block":hit_block };
+}
+
+/////////////////////////////////////
+// SS ALGORITHM CODE
+/////////////////////////////////////
+//
+// * Flooding algorithm
+// * Forward Sim algorithm
+//
+
+/*
+ * cell is a tuple
+ * returns list of neighbors
+ */
+var floodingAlgorithmMakeNeighbors = function(cell) {
+  var neighborDirs = [[0,-1],[-1,0],[0,1],[1,0]];
+  
+  var neighbors = map(function(dir) {
+                        return [cell[0] + dir[0], cell[1] + dir[1]];
+                      },
+                      neighborDirs);
+
+  return neighbors;
+}
+
+/* returns those elements of tupleList1, in
+ * their original order, which are not contained
+ * anywhere in tupleList2. Runtime is quadratic :(
+ */
+var tupleOrderedSetMinus = function(tupleList1, tupleList2) {
+  return filter(function(tup) {
+                  return find(function(tup2) { tup[0]==tup2[0] && tup[1]==tup2[1] }, tupleList2)==undefined;
+                }, tupleList1);
+}
+
+/*
+ * Flooding Algorithm! O(n^2k) algorithm to
+ * flood an n-by-n board, implemented one O(ik) step
+ * at a time (taking n steps total) (n is board max dimension,
+ * i is step no., k is number of blocks on board)
+ *
+ * Because of parity and other reasons, this algorithm
+ * can update the frontier in simple O(i) time, with no need
+ * for set-like data structures or O(i^2) cross-comparisons
+ * to prune duplicate cells.
+ *
+ * State is frontier and prev_frontier
+ * 
+ * state is a frontier of cells, which contains
+ *   information about each cell's parent cell.
+ * world_grid is the world grid. undefined where passable,
+ *   defined otherwise. 2 nested arrays.
+ *
+ * returns (next_state, output)
+ */
+var floodingAlgorithmStep = function(state, world_grid) {
+  var frontier = state[0];
+  var prevFrontier = state[1];
+
+  // For each frontier cell, get its children
+  var unprunedUnflatNextFrontier = map(
+                              function(cell) {
+                                return floodingAlgorithmMakeNeighbors(cell);
+                              },
+                              frontier);
+  var unprunedNextFrontier0 = reduce(function(x, acc) { return x.concat(acc) },
+                         [], unprunedUnflatNextFrontier);
+
+  // Now make this child list unique
+  var unprunedNextFrontier1 = map(function(l) { return l[0]; }, groupBy(function(i,j) { return i[0]==j[0] && i[1]==j[1]; }, unprunedNextFrontier0));
+
+  // Now, remove all cells that are from a previous frontier
+  var unprunedNextFrontier2 = tupleOrderedSetMinus(unprunedNextFrontier1, prevFrontier);
+  
+  // Before checking passability, note which cells we've just-now `touched`
+  var unprunedIds = map(
+                  function(cell) {
+                    var r = cell[0];
+                    var c = cell[1];
+                    return (r >= 0 && r < world_grid.length && c >= 0 && c < world_grid[r].length) ? world_grid[r][c] : -1;
+                  },
+                  unprunedNextFrontier2);
+
+  // Of course, we only want frontier cells that are actually passable
+  var nextFrontier = filter(
+                  function(cell) {
+                    var r = cell[0];
+                    var c = cell[1];
+
+                    return r >= 0 && r < world_grid.length && c >= 0 && c < world_grid[r].length && (world_grid[r][c] == -1);
+                  },
+                  unprunedNextFrontier2);
+  return [[nextFrontier,frontier], unprunedIds];
+}
+
+var floodingAlgorithmWholeHelper = function(state, found, target_ids, world_grid, maxN) { 
+  var frontier = state[0];
+  var prevFrontier = state[1];
+  
+  var stepResults = floodingAlgorithmStep(state, world_grid);
+  
+  var nextFrontier = stepResults[0][0];
+  //console.log(stepResults);
+  var idsTouched = stepResults[1];
+  var nextFound = mapIndexed(
+                      function(i,hasBeenFound) {
+                        return hasBeenFound ||
+                              any(function(id) {
+                                return target_ids[i]==id;
+                              }, idsTouched);
+                      },
+                      found);
+  var nextState = [nextFrontier, frontier];
+  
+  return maxN < 1 || nextFrontier.length == 0 || all(function(i){return i},nextFound) ? nextFound : floodingAlgorithmWholeHelper(nextState, nextFound, target_ids, world_grid, maxN-1);
+}
+
+/*
+ * Requires that the seed start cell be within one cell of a
+ * passable cell
+ */
+var getPassableStartCell = function(start_cell, world_grid) {
+  var alternates = [[0,0],[-1,0],[0,-1],[1,0],[0,1]];
+  var safeStartCell = find(
+                    function(cell) {
+                      var r = cell[0];
+                      var c = cell[1];
+
+                      return r >= 0 && r < world_grid.length && c >= 0 && c < world_grid[r].length && (world_grid[r][c] == -1);
+                    },map(function(delt) { return [start_cell[0]+delt[0],start_cell[1]+delt[1]]; }, alternates));
+  var debug = safeStartCell == undefined ? 
+          json.write('data/worldGridUndefined.json', {"start_cell":start_cell, "world_grid":world_grid}) : 0;
+  return safeStartCell;
+}
+
+/*
+ * Returns whether start_state is connected to target_ids (entries in world_grid) via
+ * an unbroken line of -1 cells in world_grid
+ */
+var floodingAlgorithmWhole = function(start_cell, target_ids, world_grid, maxN, safely) {
+  var startCellSafe = safely ? getPassableStartCell(start_cell, world_grid) : start_cell;
+  
+  var start_state = [[startCellSafe],[]];
+  var results = floodingAlgorithmWholeHelper(
+                        start_state,
+                        map(
+                            function(id) {
+                              return world_grid[startCellSafe[0]][startCellSafe[1]]==id;
+                            },
+                            target_ids
+                        ),
+                        target_ids,
+                        world_grid,
+                        maxN);
+  return results;
+}
+
+/*
+ *
+ * For during inference; on a timestep n, this function will
+ * advance the flood frontier by one step, and will output
+ * the connectivity results so far for that timestep (as well
+ * as the state necessary for the next timestep).
+ *
+ * [flood_state, found, 
+ *
+ */
+var floodingAlgorithmInferenceInit = function(world, world_grid, cell_size) {
+  var startCell = [Math.floor(world.ball_traj[0][1]/cell_size),Math.floor(world.ball_traj[0][0]/cell_size)];
+  var startCellSafe = getPassableStartCell(startCell, world_grid);
+  
+  var start_state = [[startCellSafe],[]];
+
+  var found = map (
+                function(id) {
+                  return world_grid[startCellSafe[0]][startCellSafe[1]]==id;
+                },
+                [0,1] );
+
+  return [start_state, found]
+}
+var floodingAlgorithmInferenceHelper = function(flood_inf_state, target_ids, world_grid, maxN) { 
+  var state = flood_inf_state[0];
+  var found = flood_inf_state[1];
+  
+  var frontier = state[0];
+  var prevFrontier = state[1];
+  
+  var stepResults = floodingAlgorithmStep(state, world_grid);
+  
+  var nextFrontier = stepResults[0][0];
+  //console.log(stepResults);
+  var idsTouched = stepResults[1];
+  var nextFound = mapIndexed(
+                      function(i,hasBeenFound) {
+                        return hasBeenFound ||
+                              any(function(id) {
+                                return target_ids[i]==id;
+                              }, idsTouched);
+                      }, found);
+  var nextState = [nextFrontier, frontier];
+  
+  return maxN < 1 || nextFrontier.length == 0 || all(function(i){return i},nextFound) ?
+        [nextState, nextFound] : floodingAlgorithmInferenceHelper([nextState, nextFound], target_ids, world_grid, maxN-1);
+}
+var floodingAlgorithmInferenceStep = function(flood_inf_state, world_grid, n_step) {
+  var results = floodingAlgorithmInferenceHelper(
+                        flood_inf_state,
+                        [0,1],
+                        world_grid,
+                        n_step);
+  
+  return results; // [flood_state, found]
+}
+
+/*
+ *
+ * Forward Sim Algorithm
+ *
+ * simulates an ensemble of stochastically-perturbed balls forward
+ * at varying velocities.
+ *
+ * sim_state contains the states of all the balls as well as the
+ * collision results so far (eg. balls disappear once collided).
+ *
+ * sim_state = [ball_ensemble, [#r, #g], time_start, time_run, n]
+ */
+var position_sigma = 0.0; // for now, no position noise; don't want to deal with lodging a ball in a wall
+var velocity_sigma = 7.0;
+var forwardSimInferenceInit = function(ball_state, time_start, n) {
+  // draw n randomly-perturbed versions of the ball
+  var ballEnsemble = repeat(n, function() {
+                              return [ball_state[0],ball_state[1],
+                                      gaussian(ball_state[2], velocity_sigma),
+                                      gaussian(ball_state[3], velocity_sigma)];
+                            });
+  
+  return [ballEnsemble, [0,0], time_start, 0, n];
+}
+var forwardSimInferenceStep = function(sim_state, time_to_advance_by, world) {
+  var ballEnsemble = sim_state[0];
+  var hitCounts = sim_state[1];
+  var timeStart = sim_state[2];
+  var timeRun = sim_state[3];
+  var numBalls = sim_state[4];
+
+  // advance all the balls through the world
+  var stepResults = map(
+          function(ball) {
+            var collisionResults = advanceBallUntilCollisions(ball, world.geom_list, world.ball_radius, [0,1], time_to_advance_by, 5000);
+            
+            var ballTraj = collisionResults[0];
+            var tColl = collisionResults[1];
+            var collidedId = collisionResults[2];
+            
+            return [ ballTraj[ballTraj.length-1], collidedId ]
+          },
+          ballEnsemble);
+          
+  // only those balls which haven't yet collided should remain
+  // in ensemble
+  var nextEnsemble =  map(function(tup){return tup[0]},
+                      filter(function(tup){return tup[1]==-1},stepResults) );
+                      
+  // collided balls, on the other hand, shall be added to our ensemble
+  var nextHitCounts = reduce(
+                function(x,acc){
+                  return x[1]==-1 ? acc : (x[1]==0 ? [acc[0]+1,acc[1]] : [acc[0],acc[1]+1]);
+                },
+                hitCounts,
+                stepResults);
+                
+  return [nextEnsemble, nextHitCounts, timeStart, timeRun + time_to_advance_by, numBalls];
+}
+
+/////////////////////////////////////
+// SS INFERENCE CODE
+/////////////////////////////////////
+//
+// Need code to do inference over world.
+// This requires observation model, transition model,
+// and representation of belief state.
+//
+// Eventually, in fact, I will be doing a POMDP with
+// inference over belief states, in a way. But, will not
+// explicitly represent that state of beliefs over beliefs.
+// Instead, will use current belief along with a
+// probabilistic rollout in order to determine expected
+// reward.
+//
+// Things I need:
+// 
+// Transition Model: P(St+1|St) --- might not need this, as it's really identity.
+// Obs Model: P(Ot|St,At) (basically, need one of these for each kind of action)
+// Prior: P(S0)
+// Reward Function: R(At|St)
+//
+// Specific to POMDP:
+//
+// Rollout procedure under Forward Sim policy, computing E(R)
+// Rollout procedure under Flooding policy, computing E(R)
+//
+// Of what things am I certain by the end? [[B->R vs B->G, and t_coll]].
+//  -> My reward for a given run will be computed cumulatively for each
+//     possible world, evaluated on the SURE world that I have by the end
+//     of the rollout. There are only two, after all: R(At|B->R) & R(At|B->G).
+//  -> For now, reward will be %a==R/G, rather than #a==R/G
+
+/*
+ * Obs model for Forward Sim
+ *
+ * Start sim a t_start then f(t_coll, t_start) fraction will eventually hit R.
+ *
+ * state is [B->R 0/1, B~G 0/1, B~R 0/1, t_coll]
+ * obs will be [dist%R, dist%G]
+ *
+ */
+var observeDistForwardSim = function(state, t, t_start) {
+  var hitR = state[0];
+  var connG = state[1];
+  var connR = state[2];
+  var tColl = state[3];
+  
+  var lambdaHit = 1;
+  var sigmaObs = 1;
+  var fracFalse = 0.2;
+
+  var totalHitTrue = lambdaHit*Math.exp(-lambdaHit*(tColl - t_start)); // total amount that will be hit by sim will approach 1 exponentially TODO Empirical.
+  var expectedFracHitSoFar = (t-t_start)/(tColl-t_start); // increase as a ratio.
+  var percentTrue = Gaussian(expectedFracHitSoFar*totalHitTrue, sigmaObs);
+  
+  var totalHitFalse = fracFalse * (1-totalHitTrue);
+  var percentFalse = Gaussian(expectedFracHitSoFar*totalHitFalse, sigmaObs);
+  
+  var zeroDist = Delta({v:0});
+  
+  // Figure out based on [connectivity, true hit] which dists are needed.
+  return  !connG ? [percentTrue, zeroDist] :
+            !connR ? [zeroDist, percentTrue] :
+               hitR ? [percentTrue, percentFalse] : [percentFalse, percentTrue];
+}
+
+
+/*
+ * Obs model for Flood Connectivity
+ *
+ * Start sim a t_start then f(t_coll, t_start) fraction will eventually hit R.
+ *
+ * state is [B->R==0/1, B~G==0/1, B~R==0/1, t_coll, t_flood, t_floodT, t_floodF]
+ * obs will be [foundRYet, foundGYet, done]
+ *
+ */
+var observeDistFloodConn = function(state, t, t_start) {
+  var hitR = state[0];
+  var connG = state[1];
+  var connR = state[2];
+  var tColl = state[3];
+  
+  var tDone = t_start + ((tColl-t_start)/3);
+  var tDoneSigma = t_start + ((tColl-t_start)/3);
+  var tFindSigma = 1.0;
+
+  var probHitConn = Gaussian(tDone/2, Math.sqrt(tFindSigma*tFindSigma + tDoneSigma*tDoneSigma/9));
+  var probTDone = Gaussian(tDone, tDoneSigma);
+  
+  // Figure out based on [connectivity, true hit] which dists are needed.
+  return  !connG ? [] :
+            !connR ? [zeroDist, percentTrue] :
+               hitR ? [percentTrue, percentFalse] : [percentFalse, percentTrue];
+}
+
+/////////////////////////////////////
+// SS MAIN
+/////////////////////////////////////
+
+var worldIsValid = function(world) {
+  // Check if the last state in balltraj is overlapping any blocks; this is INVALID
+  var lastBall = world.ball_traj[0]; // world.ball_traj[world.ball_traj.length-1];
+  var isntOverlappingGeom = !any(function(block) { return ballOverlapsGeom(lastBall,block,world.ball_radius); }, world.geom_list);
+/*
+  var redBlock = world.geom_list[0];
+  var redIsntOverlappingGeom = !any(
+      function(tup) { return tup[0]!=0 && geomCoversGeom(tup[1],redBlock); },
+        mapIndexed(
+        function(i,blk) {
+          [i,blk];
+        }, world.geom_list));
+  var greenBlock = world.geom_list[1];
+  var greenIsntOverlappingGeom = !any(
+      function(tup) { return tup[0]!=1 && geomCoversGeom(tup[1],greenBlock); },
+        mapIndexed(
+        function(i,blk) {
+          [i,blk];
+        }, world.geom_list)); */
+  
+  return isntOverlappingGeom;// && redIsntOverlappingGeom && greenIsntOverlappingGeom;
+}
+
+var worldGridIsValid = function(world, worldGridObj) {
+  var worldGrid = worldGridObj.world_grid;
+  var cellSize = worldGridObj.cell_size;
+  var startCell = [Math.floor(world.ball_traj[0][1]/cellSize),Math.floor(world.ball_traj[0][0]/cellSize)];
+
+  return getPassableStartCell(startCell, worldGrid)!=undefined;
+}
+
+var checkConnectivity = function(world, worldGridObj, connected) {
+  var worldGrid = worldGridObj.world_grid;
+  var cellSize = worldGridObj.cell_size;
+  var startCell = [Math.floor(world.ball_traj[0][1]/cellSize),Math.floor(world.ball_traj[0][0]/cellSize)];
+//  var connectivity = floodingAlgorithmWhole(startCell, [0,1], worldGrid, Infinity, true);
+
+  return getPassableStartCell(startCell, worldGrid)==undefined ? false :
+        (!connected) ^ all(function(found) { found },
+                  floodingAlgorithmWhole(startCell, [0,1], worldGrid, Infinity, true));
+}
+
+/* var checkRGConnectivity = function(world, target_connectivity) {
+  var worldGridObj = makeWorldGrid(world);
+  var worldGrid = worldGridObj.world_grid;
+  var cellSize = worldGridObj.cell_size;
+  var ballStartLoc = world.ball_traj[Math.floor(world.ball_traj.length/2)]
+  var startCell = [Math.floor(ballStartLoc[1]/cellSize),Math.floor(ballStartLoc[0]/cellSize)];
+  
+  var unhitConnectivity = floodingAlgorithmWhole(startCell, [1-world.hit_block], worldGrid, Infinity, true);
+  var connectivity = world.hit_block==0 ? [true, unhitConnectivity] : [unhitConnectivity, true];
+
+  return all(function(tup) { !(tup[0] ^ tup[1]) }, zip(connectivity, target_connectivity));
+}*/
+
+
+
+var validWorldMaker = function() {
+  var world = makeWorld(0.5, 0.9, 500.0, 0.9);
+  
+  var checkGridStuff = function(world) {
+    var worldGridObj = makeWorldGrid(world);
+    return worldGridIsValid(world, worldGridObj)
+                && checkConnectivity(world, worldGridObj, true)
+  }
+
+  condition(world.t_coll > 4.0  // && world.hit_block == 1
+                && worldIsValid(world)
+                && checkGridStuff(world));
+  return world;
+}
+
+
+var writeToDataWorldsC = function(index) {
+
+  var worldDist = Infer({model:validWorldMaker, method:"rejection", samples:1});
+
+  display('  world generated');
+
+  var world = sample(worldDist);
+  var worldGridObj = makeWorldGrid(world);
+
+  // Forward Sim
+  var runSimFromStartColl = function(coll_start) {
+    var simInitState = forwardSimInferenceInit(world.ball_traj[coll_start], 0, 100);
+    var simResults = reduce(
+                    function(ignore, acc) {
+                      var nextState = forwardSimInferenceStep(acc[acc.length-1],world.t_coll/10.0,world);
+                      return acc.concat([nextState]);
+                    },
+                    [simInitState],
+                    mapN(function(i){return i}, 20));
+    var hitRates = map( function(state){return state[1]}, simResults);
+    
+    return hitRates;
+  }
+  
+  var collStarts = [0,
+                    Math.floor(1*world.ball_traj.length/4),
+                    Math.floor(2*world.ball_traj.length/4),
+                    Math.floor(3*world.ball_traj.length/4),
+                    Math.floor(world.ball_traj.length > 2 ? world.ball_traj.length-2 : 0)]
+  var allHitResults = map(runSimFromStartColl, collStarts);
+  
+  // Flooding
+  var worldGrid = worldGridObj.world_grid;
+  var cellSize = worldGridObj.cell_size;
+  var simInitState = floodingAlgorithmInferenceInit(world, worldGrid, cellSize);
+  var ballStart = world.ball_traj[0]
+  var ballSpeed = Math.sqrt(ballStart[2]*ballStart[2] + ballStart[3]*ballStart[3]);
+  var simResults = reduce(
+                  function(ignore, acc) {
+                    var nextState = floodingAlgorithmInferenceStep(acc[acc.length-1],worldGrid,Math.ceil(world.world_dims[0]/cellSize) / 40);
+                    return acc.concat([nextState]);
+                  },
+                  [simInitState],
+                  mapN(function(i){return i}, 80));
+
+  var floodResults = map( function(state){return [state[0][0].length, state[1]];}, simResults); // don't store frontier.
+  
+  var totalBundle = {world:world, world_grid:worldGridObj, index:index, forward:allHitResults, flood:floodResults};
+
+  json.write('dataWorldsC/world' + index + '.json', totalBundle);
+
+  display('World ' + index + ' written...')
+}
+
+mapN(writeToDataWorldsC, 1000);
