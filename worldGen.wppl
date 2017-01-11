@@ -1526,7 +1526,7 @@ var monteCarloRolloutPolicy = function(stateDist, knownState, constants, maxN) {
                           flip(.0001) ? true : hmmEvaluateRecursive(0, stateNext, knownStatesRoll, constants, observationsRollNext, maxN);//maxN-maxNRoll);
                           return stateNext;
                         }
-                        var stateDistNext = Infer({method:'MCMC', samples: 120}, stateInference);
+                        var stateDistNext = Infer({method:'MCMC', samples: 500}, stateInference);
                         //var stateDistNext = Infer({method:'rejection', samples: 1000}, function() { return flip(.01) ? (flip(.5) ? [true, false, knownStateRoll[8]+.1] : [false, false, knownStateRoll[8]+.1]) : sample(stateDistNextA) });
                         // TODO: Prevent impoverished stateDist from ruining run. Add in one of each kind of connectivity, 1:100 probability? (with valid t_done)
                         
@@ -1550,8 +1550,8 @@ var monteCarloRolloutPolicy = function(stateDist, knownState, constants, maxN) {
                                               action_hist)) : rollOnceHelp();
                     } // wrollOnce
                     // MC rollout of policy
-                    var rewardDist = Infer({method:'rejection', samples: 5}, function(){var rew = rollOnce(stateDist, [knownState], [], maxN); return rew});
-                    var rewardE = listMean(repeat(25,function(){return sample(rewardDist)}));
+                    var rewardDist = Infer({method:'rejection', samples: 20}, function(){var rew = rollOnce(stateDist, [knownState], [], maxN); display('rolled out...'); return rew});
+                    var rewardE = listMean(repeat(200,function(){return sample(rewardDist)}));
 //                    var rewardE = listMean(repeat(5,function(){var rew = rollOnce(stateDist, [knownState], [], maxN); display(rew); return rew}));
                     display([policy(0,knownState),rewardE]);
                     return [policy(0,knownState),rewardE];
@@ -1670,7 +1670,8 @@ display('Lets do this');
 var testWorldN = function(nOff) {
   var n = nOff;
   display('dataWorldsC/world' + n + '.json');
-  var worldRunObj = json.read('dataWorldsC/world' + n + '.json');
+  // TODOOOOO var worldRunObj = json.read('dataWorldsC/world' + n + '.json');
+  var worldRunObj = json.read('dataWorldsC/world' + 1 + '.json');
   var world = worldRunObj.world;
   var worldGridObj = worldRunObj.world_grid;
   var worldGrid = worldGridObj.world_grid;
@@ -1689,13 +1690,13 @@ var testWorldN = function(nOff) {
   var numberRand = gaussian({mu:0, sigma:0.5});
   var results = pomdpExecRecursive(0, statePrior, [knownState0], constants, algStates, [], [], world, worldGrid);
 
-  json.write('model_trials/pomdpResultsDefault'+n+'.json',results);
+  json.write('model_trials/dataWorldsC/pomdpResultsDefault'+n+'.json',results);
 
   display(results);
-  display(results[0][(results[0].length)-1][7]); // actions
+  // display(results[0][(results[0].length)-1][7]); // actions
 }
 
-mapN(testWorldN, 15);
+mapN(testWorldN, 400);
 
 
 'done'
